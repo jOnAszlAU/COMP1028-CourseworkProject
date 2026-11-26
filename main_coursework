@@ -4,10 +4,34 @@
 #include <ctype.h>
 
 #define MAX_WORD_LEN 50
-#define MAX_UNIQUE_WORDS 5000
 #define MAX_PATH_LEN 256
 #define MAX_DOCS 20000
-#define MAX_CORPUS_VOCAB 100000
+
+// --- Data Structures ---
+
+typedef struct {
+    int doc_id;
+    char filepath[MAX_PATH_LEN];
+    int total_terms;   // Document length (for relevance scoring)
+    int unique_terms;  // Unique searchable terms in this document
+    int is_valid;
+} Document;
+
+// Linked-list node representing one document where a term occurs
+typedef struct PostingNode {
+    int doc_id;
+    int term_freq;            // How many times the term appears in this doc (TF)
+    struct PostingNode *next;
+} PostingNode;
+
+// Array entry representing one unique word in the corpus vocabulary
+typedef struct {
+    char term[MAX_WORD_LEN];
+    int doc_freq;             // Number of documents containing this term (DF)
+    PostingNode *postings;    // Head of the linked-list posting list
+} VocabEntry;
+
+// --- Stopword Filter ---
 
 const char *STOPWORDS[] = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
@@ -15,81 +39,116 @@ const char *STOPWORDS[] = {
     "between", "both", "but", "by", "can", "could", "did", "do", "does", "doing",
     "down", "during", "each", "few", "for", "from", "further", "had", "has", "have",
     "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how",
-    "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more",
-    "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once",
-    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "re",
-    "same", "she", "should", "so", "some", "such", "than", "that", "the", "their",
-    "theirs", "them", "themselves", "then", "there", "these", "they", "this", "those",
+    "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me",
+    "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off",
+    "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over",
+    "own", "same", "she", "should", "so", "some", "such", "than", "that", "the",
+    "their", "theirs", "them", "themselves", "then", "there", "these", "they", "this", "those",
     "through", "to", "too", "under", "until", "up", "very", "was", "we", "were",
     "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with",
     "would", "you", "your", "yours", "yourself", "yourselves"
 };
-const int NUM_STOPWORDS = sizeof(STOPWORDS) / sizeof(STOPWORDS[0]);
 
-typedef struct {
-    char word[MAX_WORD_LEN];
-    int frequency; // Term frequency within this document
-} TermEntry;
+#define STOPWORD_COUNT (sizeof(STOPWORDS) / sizeof(STOPWORDS[0]))
 
-typedef struct {
-    int doc_id;
-    char filepath[MAX_PATH_LEN];
-    int raw_terms;       // Total words before stopword removal
-    int total_terms;     // Total searchable terms after stopword removal
-    int unique_terms;    // Unique searchable terms in this document
-    TermEntry *terms;
-    int is_valid;
-} Document;
-
-// Comparator for bsearch on STOPWORDS
-int compare_strings(const void *a, const void *b) {
-    const char *key = (const char *)a;
-    const char *elem = *(const char **)b;
-    return strcmp(key, elem);
-}
-
-// filtering rules:
-// minimum length of 2 characters
-// not in stopwords list
-int is_stopword_or_invalid(const char *word) {
-    if (strlen(word) < 2) {
+int is_stopword(const char *word) {
+    if (word[0] == '\0' || word[1] == '\0') {
         return 1;
     }
-    if (bsearch(word, STOPWORDS, NUM_STOPWORDS, sizeof(char *), compare_strings) != NULL) {
-        return 1;
+    for (int i = 0; i < (int)STOPWORD_COUNT; i++) {
+        if (strcmp(word, STOPWORDS[i]) == 0) {
+            return 1;
+        }
     }
     return 0;
 }
 
-// finds searchable term and then increments the count
-void record_term(const char *word, TermEntry *temp_terms, int *unique_count, int *hit_limit, int doc_id, const char *filepath) {
-    for (int i = 0; i < *unique_count; i++) {
-        if (strcmp(temp_terms[i].word, word) == 0) {
-            temp_terms[i].frequency++;
-            return;
+// --- Inverted Index Functions ---
+
+// Finds the index of 'term' in the vocab array, or returns -1 if not found
+int find_term_index(VocabEntry *vocab, int vocab_count, const char *term) {
+    for (int i = 0; i < vocab_count; i++) {
+        if (strcmp(vocab[i].term, term) == 0) {
+            return i;
         }
     }
+    return -1;
+}
 
-    if (*unique_count < MAX_UNIQUE_WORDS) {
-        strcpy(temp_terms[*unique_count].word, word);
-        temp_terms[*unique_count].frequency = 1;
-        (*unique_count)++;
-    } else if (!(*hit_limit)) {
-        *hit_limit = 1;
-        printf("[Doc ID: %d] Note: Reached MAX_UNIQUE_WORDS (%d) in '%s'\n",
-               doc_id, MAX_UNIQUE_WORDS, filepath);
+// Adds a term occurrence to the inverted index (dynamic array + linked list)
+void add_to_index(VocabEntry **vocab_ptr, int *vocab_count, int *vocab_capacity,
+                  const char *term, int doc_id, int *is_new_in_doc) {
+    *is_new_in_doc = 0;
+    VocabEntry *vocab = *vocab_ptr;
+
+    int idx = find_term_index(vocab, *vocab_count, term);
+
+    // If the word is new to the vocabulary, expand the array if needed and add it
+    if (idx == -1) {
+        if (*vocab_count >= *vocab_capacity) {
+            int new_cap = (*vocab_capacity == 0) ? 1024 : (*vocab_capacity * 2);
+            VocabEntry *temp = realloc(vocab, new_cap * sizeof(VocabEntry));
+            if (temp == NULL) {
+                printf("Error: Out of memory expanding vocabulary.\n");
+                return;
+            }
+            vocab = temp;
+            *vocab_ptr = vocab;
+            *vocab_capacity = new_cap;
+        }
+
+        idx = *vocab_count;
+        strcpy(vocab[idx].term, term);
+        vocab[idx].doc_freq = 0;
+        vocab[idx].postings = NULL;
+        (*vocab_count)++;
+    }
+
+    // Update the linked-list posting list for vocab[idx].
+    // Since documents are loaded in order (doc_id 1, 2, 3...), the current doc_id
+    // will always be at the head of the posting list if already seen in this doc.
+    if (vocab[idx].postings != NULL && vocab[idx].postings->doc_id == doc_id) {
+        vocab[idx].postings->term_freq++;
+    } else {
+        PostingNode *new_node = malloc(sizeof(PostingNode));
+        if (new_node == NULL) {
+            printf("Error: Out of memory allocating posting node.\n");
+            return;
+        }
+        new_node->doc_id = doc_id;
+        new_node->term_freq = 1;
+        new_node->next = vocab[idx].postings;
+        vocab[idx].postings = new_node;
+
+        vocab[idx].doc_freq++;
+        *is_new_in_doc = 1;
     }
 }
 
-Document process_document(int doc_id, const char *filepath) {
+// Frees every linked-list posting node and then the vocabulary array
+void free_index(VocabEntry *vocab, int vocab_count) {
+    for (int i = 0; i < vocab_count; i++) {
+        PostingNode *curr = vocab[i].postings;
+        while (curr != NULL) {
+            PostingNode *next_node = curr->next;
+            free(curr);
+            curr = next_node;
+        }
+    }
+    free(vocab);
+}
+
+// --- Document Processing ---
+
+Document process_document(int doc_id, const char *filepath,
+                          VocabEntry **vocab, int *vocab_count, int *vocab_capacity,
+                          long *stopwords_skipped) {
     Document doc;
     doc.doc_id = doc_id;
     strncpy(doc.filepath, filepath, MAX_PATH_LEN - 1);
     doc.filepath[MAX_PATH_LEN - 1] = '\0';
-    doc.raw_terms = 0;
     doc.total_terms = 0;
     doc.unique_terms = 0;
-    doc.terms = NULL;
     doc.is_valid = 0;
 
     FILE *file = fopen(filepath, "r");
@@ -98,64 +157,49 @@ Document process_document(int doc_id, const char *filepath) {
         return doc;
     }
 
-    TermEntry *temp_terms = malloc(MAX_UNIQUE_WORDS * sizeof(TermEntry));
-    if (temp_terms == NULL) {
-        printf("[Doc ID: %d] Error: Memory allocation failed for '%s'\n", doc_id, filepath);
-        fclose(file);
-        return doc;
-    }
-
     char word_buffer[MAX_WORD_LEN];
     int buffer_index = 0;
     int ch;
-    int hit_limit = 0;
+    int is_new_in_doc = 0;
 
     while ((ch = fgetc(file)) != EOF) {
-        ch = tolower((unsigned char)ch); // turn into lowercase
+        ch = tolower((unsigned char)ch);
 
         if (isalpha((unsigned char)ch)) {
             if (buffer_index < MAX_WORD_LEN - 1) {
                 word_buffer[buffer_index++] = (char)ch;
             }
         } else {
-            if (buffer_index > 0) { // ignore empty tokens
+            if (buffer_index > 0) {
                 word_buffer[buffer_index] = '\0';
-                doc.raw_terms++;
-
-                if (!is_stopword_or_invalid(word_buffer)) {
+                if (is_stopword(word_buffer)) {
+                    (*stopwords_skipped)++;
+                } else {
                     doc.total_terms++;
-                    record_term(word_buffer, temp_terms, &doc.unique_terms, &hit_limit, doc_id, filepath);
+                    add_to_index(vocab, vocab_count, vocab_capacity, word_buffer, doc_id, &is_new_in_doc);
+                    if (is_new_in_doc) doc.unique_terms++;
                 }
                 buffer_index = 0;
             }
         }
     }
 
-    // Handle trailing word at endof file
     if (buffer_index > 0) {
         word_buffer[buffer_index] = '\0';
-        doc.raw_terms++;
-
-        if (!is_stopword_or_invalid(word_buffer)) {
+        if (is_stopword(word_buffer)) {
+            (*stopwords_skipped)++;
+        } else {
             doc.total_terms++;
-            record_term(word_buffer, temp_terms, &doc.unique_terms, &hit_limit, doc_id, filepath);
+            add_to_index(vocab, vocab_count, vocab_capacity, word_buffer, doc_id, &is_new_in_doc);
+            if (is_new_in_doc) doc.unique_terms++;
         }
     }
 
     fclose(file);
 
     if (doc.total_terms == 0) {
-        printf("[Doc ID: %d] Warning: '%s' has no searchable terms (skipping)\n", doc_id, filepath);
-        free(temp_terms);
         return doc;
     }
-
-    // memory allocation... to not waste memory
-    doc.terms = malloc(doc.unique_terms * sizeof(TermEntry));
-    if (doc.terms != NULL) {
-        memcpy(doc.terms, temp_terms, doc.unique_terms * sizeof(TermEntry));
-    }
-    free(temp_terms);
 
     doc.is_valid = 1;
     return doc;
@@ -164,65 +208,92 @@ Document process_document(int doc_id, const char *filepath) {
 int main(void) {
     FILE *list_file = fopen("filelist.txt", "r");
     if (list_file == NULL) {
-        printf("Error: Could not open 'filelist.txt'. Please create it with your file paths.\n");
+        printf("Error: Could not open 'filelist.txt'.\n");
         return 1;
     }
 
     Document *docs = malloc(MAX_DOCS * sizeof(Document));
     if (docs == NULL) {
-        printf("Error: Could not allocate memory for document collection.\n");
+        printf("Error: Could not allocate document array.\n");
         fclose(list_file);
         return 1;
     }
 
+    // Dynamic array for the inverted index vocabulary
+    VocabEntry *vocab = NULL;
+    int vocab_count = 0;
+    int vocab_capacity = 0;
+
     int doc_count = 0;
     int next_doc_id = 1;
-    long total_raw_words = 0;
-    long total_searchable_words = 0;
+    long total_searchable_terms = 0;
+    long total_stopwords_skipped = 0;
 
     char filepath[MAX_PATH_LEN];
 
-    printf("Loading and tokenizing corpus...\n");
-
+    printf("Building inverted index...\n");
     while (fgets(filepath, sizeof(filepath), list_file) != NULL) {
-        if (doc_count >= MAX_DOCS) {
-            printf("Warning: Reached MAX_DOCS (%d). Stopping file loading.\n", MAX_DOCS);
-            break;
-        }
+        if (doc_count >= MAX_DOCS) break;
 
         filepath[strcspn(filepath, "\r\n")] = '\0';
-        if (filepath[0] == '\0') {
-            continue;
-        }
+        if (filepath[0] == '\0') continue;
 
-        Document current_doc = process_document(next_doc_id, filepath);
+        Document current_doc = process_document(next_doc_id, filepath,
+                                                &vocab, &vocab_count, &vocab_capacity,
+                                                &total_stopwords_skipped);
 
         if (current_doc.is_valid == 1) {
             docs[doc_count] = current_doc;
-            total_raw_words += docs[doc_count].raw_terms;
-            total_searchable_words += docs[doc_count].total_terms;
+            total_searchable_terms += docs[doc_count].total_terms;
             doc_count++;
             next_doc_id++;
         }
     }
-
     fclose(list_file);
 
+    printf("Valid Documents Indexed:   %d\n", doc_count);
+    printf("Unique Vocabulary Terms:   %d\n", vocab_count);
+    printf("Total Searchable Terms:    %ld\n", total_searchable_terms);
+    printf("Stopwords/Noise Filtered:  %ld\n", total_stopwords_skipped);
 
-    printf("Valid Documents Loaded:      %d\n", doc_count);
-    printf("Total Words:             %ld\n", total_raw_words);
-    printf("Total Searchable Terms:      %ld (after stopword & length filtering)\n", total_searchable_words);
+    // Simple interactive lookup test (no files re-read from disk)
+    char query[MAX_WORD_LEN];
+    printf("\nEnter a word to search (or 'exit' to quit): ");
+    while (scanf("%49s", query) == 1 && strcmp(query, "exit") != 0) {
+        // Lowercase the query word
+        for (int i = 0; query[i] != '\0'; i++) {
+            query[i] = (char)tolower((unsigned char)query[i]);
+        }
 
-    if (doc_count > 0) {
-        printf("\nSample Doc [ID: %d] '%s' -> Total: %d | Unique: %d\n",
-               docs[0].doc_id, docs[0].filepath, docs[0].total_terms, docs[0].unique_terms);
+        if (is_stopword(query)) {
+            printf("'%s' is a stopword and was excluded from the index.\n", query);
+        } else {
+            int idx = find_term_index(vocab, vocab_count, query);
+            if (idx == -1) {
+                printf("Term '%s' was not found in any document.\n", query);
+            } else {
+                printf("Term '%s' appears in %d document(s). Showing up to 5:\n",
+                       vocab[idx].term, vocab[idx].doc_freq);
+
+                PostingNode *p = vocab[idx].postings;
+                int shown = 0;
+                while (p != NULL && shown < 5) {
+                    printf("  -> [Doc ID: %d] %s (TF: %d / %d terms)\n",
+                           p->doc_id,
+                           docs[p->doc_id - 1].filepath,
+                           p->term_freq,
+                           docs[p->doc_id - 1].total_terms);
+                    p = p->next;
+                    shown++;
+                }
+            }
+        }
+        printf("\nEnter another word (or 'exit'): ");
     }
 
-    // free all allocated memory
-    for (int i = 0; i < doc_count; i++) {
-        free(docs[i].terms);
-    }
+    // Release all dynamically allocated memory
+    free_index(vocab, vocab_count);
     free(docs);
-
+    printf("Memory freed cleanly. Goodbye!\n");
     return 0;
 }
